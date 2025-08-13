@@ -15,6 +15,9 @@ from deepxde.backend import torch as bkd  # noqa: F401
 import torch
 import plotly.graph_objects as go
 
+# --- Streamlit MUST be configured before any other st.* calls (FIX) ---
+st.set_page_config(page_title="PINN Helmholtz 3D (Room Modes)", layout="wide")
+
 # ---------------- paths / session state ----------------
 OUTDIR = pathlib.Path.cwd() / "runs"
 OUTDIR.mkdir(exist_ok=True)
@@ -38,7 +41,6 @@ def seed_all(seed: int = 0):
 seed_all(0)
 
 # ===================== UI =====================
-st.set_page_config(page_title="PINN Helmholtz 3D (Room Modes)", layout="wide")
 st.title("PINN Helmholtz 3D — Room Sound Map")
 
 colA, colB = st.columns([2, 1], gap="large")
@@ -105,24 +107,24 @@ with colB:
 
     if quick:
         width, depth = 64, 2
-        adam_lr, adam_iters = 2e-3, 100
+        adam_lr, adam_iters_default = 2e-3, 100
         n_int, n_bnd = 3000, 1000
-        display_every = 200
+        display_every = 100
         resample_every = 0
         Nplot_default = 64
         N3D_default, N3D_max = 48, 72
     else:
         width, depth = 96, 3
-        adam_lr, adam_iters = 1e-3, 5000
+        adam_lr, adam_iters_default = 1e-3, 5000
         n_int, n_bnd = 15000, 4000
-        display_every = 500
+        display_every = 200
         resample_every = 200
         Nplot_default = 96
         N3D_default, N3D_max = 64, 96
 
     if smoke_test:
         adam_lr = 3e-3
-        adam_iters = 400
+        adam_iters_default = 400
         n_int, n_bnd = 1200, 400
         width, depth = 32, 2
         display_every = 100
@@ -134,7 +136,7 @@ with colB:
     user_steps = st.slider(
         "Training steps (Adam)",
         min_value=100, max_value=20000,
-        value=int(adam_iters), step=100,
+        value=int(adam_iters_default), step=100,
         help="Total optimization steps for Adam."
     )
     strict_steps = st.checkbox(
@@ -149,7 +151,6 @@ with colB:
         help="Train in chunks so logs update during training."
     )
 
-    
     activation_key  = st.selectbox("Activation",  ["tanh", "sin", "relu"], index=0)
     initializer_key = st.selectbox("Initializer", ["Glorot uniform", "Glorot normal"], index=0)
     bc_weight = st.number_input("BC loss weight", 0.1, 50.0, 5.0, 0.1)
@@ -272,7 +273,7 @@ def vtk_structured_points_bytes(xg, yg, zg, P, name="pressure"):
         "DATASET STRUCTURED_POINTS",
         f"DIMENSIONS {Nx} {Ny} {Nz}",
         "ORIGIN 0 0 0",
-        f"SPACING {dx} {dy} {dz}",
+        f"SPACING {dx} {dy} {dz} ",
         f"POINT_DATA {Nx*Ny*Nz}",
         "SCALARS pressure float 1",
         "LOOKUP_TABLE default",
@@ -374,7 +375,7 @@ if train_btn:
     torch.set_num_threads(int(os.getenv("OMP_NUM_THREADS", "4")))
     geom = dde.geometry.Cuboid([0.0, 0.0, 0.0], [Lx, Ly, Lz])
 
-    # forcing term (Gaussian at user-chosen source position with optional carrier)
+    # --- forcing term (Gaussian at user-chosen source position with optional carrier) ---
     def forcing_term(x: torch.Tensor) -> torch.Tensor:
         xc = torch.tensor([src_x, src_y, src_z], dtype=x.dtype, device=x.device)
         r2 = torch.sum((x - xc) ** 2, dim=1, keepdim=True)
@@ -399,6 +400,9 @@ if train_btn:
                        torch.cos(k_t * x[:, 1:2]) *
                        torch.cos(k_t * x[:, 2:3]))
             return amp_t * carrier * gauss
+
+        # FIX: explicit "None" carrier -> pure Gaussian
+        return amp_t * gauss
 
     # PDE residual
     def pde_residual(x, y):
@@ -435,12 +439,10 @@ if train_btn:
             alpha_t = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
             return dpdn + alpha_t * y  # Robin: ∂p/∂n + α p = 0
 
-    bc = dde.icbc.OperatorBC(dde.geometry.Cuboid([0,0,0],[Lx,Ly,Lz]), boundary_operator_bc,
-                             on_boundary=lambda x, on_b: on_b)
+    bc = dde.icbc.OperatorBC(geom, boundary_operator_bc, on_boundary=lambda x, on_b: on_b)
 
     data = dde.data.PDE(
-        dde.geometry.Cuboid([0.0, 0.0, 0.0], [Lx, Ly, Lz]),
-        pde_residual, [bc],
+        geom, pde_residual, [bc],
         num_domain=int(n_int), num_boundary=int(n_bnd),
         train_distribution="pseudo",
     )
@@ -459,16 +461,20 @@ if train_btn:
         save_better_only=False,
         period=int(max(50, display_every))
     )
-    callbacks_adam = [ckpt]
-    if resample_every:
-        callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
-
-    # -------- Stage 1: Adam (chunked) --------
     losshist = dde.callbacks.LossHistory()
     callbacks_adam = [ckpt, losshist]
     if resample_every:
         callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
 
+    # -------- Step budget (FIX: define adam_iters_warmup) --------
+    if strict_steps:
+        adam_iters_warmup = int(user_steps)
+    else:
+        # enforce a sensible minimum warmup if user undershoots
+        min_warmup = 400 if quick or smoke_test else 2000
+        adam_iters_warmup = int(max(user_steps, min_warmup))
+
+    # -------- Stage 1: Adam (chunked) --------
     buf = io.StringIO()
     total = 0
     try:
@@ -479,17 +485,16 @@ if train_btn:
                 remaining = int(adam_iters_warmup)
                 while remaining > 0:
                     step = int(min(chunk_size, remaining))
-                    model.train(iterations=step, callbacks=callbacks_adam, display_every=100)
+                    model.train(iterations=step, callbacks=callbacks_adam, display_every=min(step, 100))
                     remaining -= step
                     total += step
 
-                    # Optional quick residual check on a small batch so you see movement
+                    # Optional quick residual check
                     try:
                         pde_chk, bc_chk = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=1200 if quick else 2000)
                     except Exception:
                         pde_chk, bc_chk = float("nan"), float("nan")
 
-                    # Last loss line from DeepXDE (can be list of components)
                     if losshist.loss_train:
                         last = losshist.loss_train[-1]
                         try:
@@ -509,7 +514,6 @@ if train_btn:
     finally:
         st.session_state["log"] += buf.getvalue()
         log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
-
 
     # -------- Stage 2: L-BFGS polish (optional) --------
     if run_lbfgs:
