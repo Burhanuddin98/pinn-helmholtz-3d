@@ -1,6 +1,5 @@
-# app.py — Streamlit PINN for 3D Helmholtz (Rigid/Neumann or Slightly Absorbing/Robin)
-# + 3D viz + probes + robust training/logging
-# Python 3.10+; numpy 1.26+; torch 2.2+ (CPU ok); deepxde 1.8.4+; streamlit; plotly
+# app.py — PINN for 3D Helmholtz in a rectangular room
+# Works with: streamlit>=1.48, deepxde==1.14.0, torch>=2.2, numpy>=1.26, plotly>=5.24, matplotlib>=3.8
 # Run: streamlit run app.py
 
 import os, io, time, pathlib, contextlib
@@ -12,7 +11,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 import deepxde as dde
-from deepxde.backend import torch as bkd  # noqa: F401 (ensures PyTorch backend import)
+from deepxde.backend import torch as bkd  # noqa: F401
 import torch
 import plotly.graph_objects as go
 
@@ -21,29 +20,33 @@ OUTDIR = pathlib.Path.cwd() / "runs"
 OUTDIR.mkdir(exist_ok=True)
 def run_tag() -> str: return time.strftime("%Y%m%d-%H%M%S")
 
-if "log" not in st.session_state: st.session_state["log"] = ""
-if "model" not in st.session_state: st.session_state["model"] = None
-if "last_tag" not in st.session_state: st.session_state["last_tag"] = ""
+# init session state early (before widgets)
+for k, v in [
+    ("log", ""),
+    ("model", None),
+    ("last_tag", ""),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ---------------- determinism + stable autodiff ----------------
+# ---------------- deterministic seeds ----------------
 def seed_all(seed: int = 0):
     np.random.seed(seed)
     torch.manual_seed(seed)
     dde.config.set_random_seed(seed)
 
 seed_all(0)
-# IMPORTANT: use forward-mode to avoid reverse-mode Hessian cache bugs
 
 # ===================== UI =====================
 st.set_page_config(page_title="PINN Helmholtz 3D (Room Modes)", layout="wide")
-st.title("PINN Helmholtz 3D — Room Sound Map (Helmholtz PDE)")
+st.title("PINN Helmholtz 3D — Room Sound Map")
 
 colA, colB = st.columns([2, 1], gap="large")
 
-# A live console that we can refresh mid-run
-console_placeholder = colA.empty()
+# Left: logs, actions, plots
 with colA:
-    console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+    log_box = st.empty()
+    log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
     row1 = st.columns([1, 1, 2])
     with row1[0]:
         train_btn = st.button("Train PINN")
@@ -54,6 +57,7 @@ with colA:
     vol_placeholder = st.empty()
     dl_placeholder = st.empty()
 
+# Right: parameters
 with colB:
     st.subheader("Room & Sound")
     c  = st.number_input("Speed of sound c [m/s]", 300.0, 380.0, 343.0, 1.0)
@@ -70,7 +74,7 @@ with colB:
     src_sigma  = st.number_input("Sigma [m]", 0.05, 1.00, 0.30, 0.01)
     src_gain   = st.number_input("Gain (amplitude)", 0.1, 50.0, 2.0, 0.1)
 
-    st.markdown("**Carrier (helps reveal clean patterns)**")
+    st.markdown("**Carrier (mode hint / plane / none)**")
     carrier_type = st.selectbox(
         "Carrier type",
         ["Mode-aligned cos(nₓπx/Lx)·cos(nᵧπy/Ly)·cos(n_zπz/Lz)", "Plane cos(kx)cos(ky)cos(kz)", "None"],
@@ -96,10 +100,8 @@ with colB:
 
     st.subheader("Training")
     quick = st.toggle("Quick mode (fast VM-friendly)", value=True)
-
-    # Super-fast smoke test: verifies end-to-end in <~1 min on CPU
     smoke_test = st.checkbox("Super-fast smoke test", value=False,
-                             help="Use tiny network and few points to confirm logs/plots work.")
+                             help="Tiny net & few points to confirm logs/plots.")
 
     if quick:
         width, depth = 64, 2
@@ -118,7 +120,6 @@ with colB:
         Nplot_default = 96
         N3D_default, N3D_max = 64, 96
 
-    # Override with smoke-test tiny settings
     if smoke_test:
         adam_lr = 3e-3
         adam_iters = 400
@@ -132,7 +133,6 @@ with colB:
     activation_key  = st.selectbox("Activation",  ["tanh", "sin", "relu"], index=0)
     initializer_key = st.selectbox("Initializer", ["Glorot uniform", "Glorot normal"], index=0)
     bc_weight = st.number_input("BC loss weight", 0.1, 50.0, 5.0, 0.1)
-
     run_lbfgs = st.toggle("Polish with L-BFGS (slower, cleaner)", value=False)
 
     slice_choice = st.selectbox("Slice to plot", ["z-mid", "y-mid", "x-mid"], index=0)
@@ -266,12 +266,10 @@ def render_plotly_3d(xg, yg, zg, P, mode="Isosurface", use_abs=False, surf_count
                      sym_zero=True, clip_mid_pct=90, demean=False):
     V = np.abs(P) if use_abs else P
     if demean: V = V - np.median(V)
-
     tail = (100 - clip_mid_pct) / 2.0
     lo_p = float(np.percentile(V, tail))
     hi_p = float(np.percentile(V, 100 - tail))
     Vc = np.clip(V, lo_p, hi_p)
-
     if sym_zero:
         rng = float(np.max(np.abs(Vc)))
         lo, hi = -rng, rng
@@ -315,7 +313,7 @@ def compute_and_show_3d(model, Lx, Ly, Lz, N3D, viz_type, use_abs, surf_count,
     with st.status("Computing 3D field…", expanded=False):
         xg, yg, zg, P = predict_grid_3d(model, Lx, Ly, Lz, N3D, N3D, N3D, batch=131072)
 
-    # PPW (points-per-wavelength) check
+    # PPW check
     dx = Lx / (N3D - 1); dy = Ly / (N3D - 1); dz = Lz / (N3D - 1)
     lam = c / f
     ppw = min(lam / dx, lam / dy, lam / dz)
@@ -382,14 +380,13 @@ if train_btn:
                        torch.cos(k_t * x[:, 2:3]))
             return amp_t * carrier * gauss
 
-        return amp_t * gauss  # None → pure Gaussian
-
     # PDE residual
     def pde_residual(x, y):
         dxx = dde.grad.hessian(y, x, i=0, j=0)
         dyy = dde.grad.hessian(y, x, i=0, j=1)
         dzz = dde.grad.hessian(y, x, i=0, j=2)
         lap = dxx + dyy + dzz
+        # Helmholtz with body-force source: ∇²p + k²p = s(x)
         return lap + (k ** 2) * y - forcing_term(x)
 
     # Unified boundary operator: Neumann (rigid) or Robin (slightly absorbing)
@@ -416,12 +413,14 @@ if train_btn:
             return dpdn
         else:
             alpha_t = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
-            return dpdn + alpha_t * y
+            return dpdn + alpha_t * y  # Robin: ∂p/∂n + α p = 0
 
-    bc = dde.icbc.OperatorBC(geom, boundary_operator_bc, on_boundary=lambda x, on_b: on_b)
+    bc = dde.icbc.OperatorBC(dde.geometry.Cuboid([0,0,0],[Lx,Ly,Lz]), boundary_operator_bc,
+                             on_boundary=lambda x, on_b: on_b)
 
     data = dde.data.PDE(
-        geom, pde_residual, [bc],
+        dde.geometry.Cuboid([0.0, 0.0, 0.0], [Lx, Ly, Lz]),
+        pde_residual, [bc],
         num_domain=int(n_int), num_boundary=int(n_bnd),
         train_distribution="pseudo",
     )
@@ -445,16 +444,14 @@ if train_btn:
         callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
 
     # -------- Stage 1: Adam warm-up --------
-    # ensure enough steps even if quick: use max of user/quick/smoke-test and a floor
     adam_iters_warmup = max(800 if quick else 3000, int(adam_iters))
-
     buf = io.StringIO()
     try:
         with st.status("Training (Adam)…", expanded=False) as st_status:
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(buf):
                 model.compile("adam", lr=adam_lr, loss_weights=[1.0, bc_weight])
-                losshist_adam, _ = model.train(
+                model.train(
                     iterations=int(adam_iters_warmup),
                     callbacks=callbacks_adam,
                     display_every=100,
@@ -465,8 +462,7 @@ if train_btn:
         st.exception(e)
     finally:
         st.session_state["log"] += buf.getvalue()
-        # refresh console immediately
-        console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+        log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
 
     # -------- Stage 2: L-BFGS polish (optional) --------
     if run_lbfgs:
@@ -476,7 +472,7 @@ if train_btn:
                 t0 = time.perf_counter()
                 with contextlib.redirect_stdout(buf2):
                     model.compile("L-BFGS")
-                    losshist_bfgs, _ = model.train()  # run to convergence
+                    model.train()  # run to convergence
                 dt = time.perf_counter() - t0
                 st_status.update(label=f"L-BFGS complete in {dt:.1f}s", state="complete")
         except Exception as e:
@@ -484,13 +480,13 @@ if train_btn:
             st.exception(e)
         finally:
             st.session_state["log"] += buf2.getvalue()
-            console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+            log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
 
     # residual metrics
     try:
         pde_rms, bc_rms = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000)
         st.session_state["log"] += f"\nPDE residual RMS: {pde_rms:.3e}   BC residual RMS: {bc_rms:.3e}\n"
-        console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+        log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
     except Exception as e:
         st.warning("Residual metrics failed.")
         st.exception(e)
@@ -522,7 +518,7 @@ if train_btn:
         p_seat = float(model.predict(np.array([[seat_x, seat_y, seat_z]], dtype=np.float32))[0, 0])
     info_placeholder.info(f"Seat probe @ ({seat_x:.2f},{seat_y:.2f},{seat_z:.2f}) m → p ≈ {p_seat:.3e}")
 
-    # Save slice + download
+    # Save slice + downloads
     tag = run_tag()
     out_npz = OUTDIR / f"slice_{which}mid-{tag}.npz"
     np.savez(out_npz, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k,
@@ -553,7 +549,6 @@ if render3d_btn:
         st.warning("Train the PINN first — no model in session.")
     else:
         model = st.session_state["model"]
-        # Recompute seat probe on demand too
         with torch.no_grad():
             p_seat = float(model.predict(np.array([[seat_x, seat_y, seat_z]], dtype=np.float32))[0, 0])
         info_placeholder.info(f"(Re)computed seat probe → p ≈ {p_seat:.3e}")
@@ -562,3 +557,4 @@ if render3d_btn:
             vol_surfaces, vol_opacity, sym_zero, clip_mid_pct, demean_for_viz,
             c, f, info_placeholder, vol_placeholder, dl_placeholder
         )
+
