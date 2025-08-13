@@ -130,6 +130,26 @@ with colB:
         Nplot_default = 48
         N3D_default, N3D_max = 32, 64
 
+    # --- User control over training length + UI update cadence ---
+    user_steps = st.slider(
+        "Training steps (Adam)",
+        min_value=100, max_value=20000,
+        value=int(adam_iters), step=100,
+        help="Total optimization steps for Adam."
+    )
+    strict_steps = st.checkbox(
+        "Use exactly this many steps (no warmup minimum)",
+        value=True,
+        help="If off, we enforce a minimum warmup based on the Quick toggle."
+    )
+    chunk_size = st.slider(
+        "UI update cadence (chunk size)",
+        min_value=50, max_value=500,
+        value=200 if quick else 300, step=50,
+        help="Train in chunks so logs update during training."
+    )
+
+    
     activation_key  = st.selectbox("Activation",  ["tanh", "sin", "relu"], index=0)
     initializer_key = st.selectbox("Initializer", ["Glorot uniform", "Glorot normal"], index=0)
     bc_weight = st.number_input("BC loss weight", 0.1, 50.0, 5.0, 0.1)
@@ -443,26 +463,53 @@ if train_btn:
     if resample_every:
         callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
 
-    # -------- Stage 1: Adam warm-up --------
-    adam_iters_warmup = max(800 if quick else 3000, int(adam_iters))
+    # -------- Stage 1: Adam (chunked) --------
+    losshist = dde.callbacks.LossHistory()
+    callbacks_adam = [ckpt, losshist]
+    if resample_every:
+        callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
+
     buf = io.StringIO()
+    total = 0
     try:
         with st.status("Training (Adam)…", expanded=False) as st_status:
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(buf):
                 model.compile("adam", lr=adam_lr, loss_weights=[1.0, bc_weight])
-                model.train(
-                    iterations=int(adam_iters_warmup),
-                    callbacks=callbacks_adam,
-                    display_every=100,
-                )
+                remaining = int(adam_iters_warmup)
+                while remaining > 0:
+                    step = int(min(chunk_size, remaining))
+                    model.train(iterations=step, callbacks=callbacks_adam, display_every=100)
+                    remaining -= step
+                    total += step
+
+                    # Optional quick residual check on a small batch so you see movement
+                    try:
+                        pde_chk, bc_chk = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=1200 if quick else 2000)
+                    except Exception:
+                        pde_chk, bc_chk = float("nan"), float("nan")
+
+                    # Last loss line from DeepXDE (can be list of components)
+                    if losshist.loss_train:
+                        last = losshist.loss_train[-1]
+                        try:
+                            loss_str = " + ".join(f"{float(x):.3e}" for x in last)
+                        except Exception:
+                            loss_str = str(last)
+                    else:
+                        loss_str = "n/a"
+
+                    st.session_state["log"] += f"[{total:5d}] loss={loss_str} | PDE_RMS={pde_chk:.3e} BC_RMS={bc_chk:.3e}\n"
+                    log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+
             dt = time.perf_counter() - t0
-            st_status.update(label=f"Adam complete in {dt:.1f}s", state="complete")
+            st_status.update(label=f"Adam finished {total} steps in {dt:.1f}s", state="complete")
     except Exception as e:
         st.exception(e)
     finally:
         st.session_state["log"] += buf.getvalue()
         log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+
 
     # -------- Stage 2: L-BFGS polish (optional) --------
     if run_lbfgs:
