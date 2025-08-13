@@ -165,7 +165,7 @@ with colB:
 
     st.subheader("Probes")
     seat_x = st.slider("Seat x [m]", 0.0, Lx, Lx*0.6, 0.05)
-    seat_y = st.slider("Seat y [m]", 0.0, Ly, Ly*0.5, 0.05)
+    seat_y = st.slider("Seat y [m]", 0.0, Ly, Lx*0.5 if Ly > 0 else 0.0, 0.05)
     seat_z = st.slider("Seat z [m]", 0.0, Lz, min(Lz*0.5, 1.2), 0.05, help="Ear height ~1.2 m if Lz≈2.4")
 
 # ===================== helpers =====================
@@ -184,7 +184,13 @@ def predict_plane(model: dde.Model, Lx, Ly, Lz, const_axis: str, const_val: floa
         raise ValueError("const_axis must be 'x','y','z'")
     model.net.eval()
     with torch.no_grad():
-        P = model.predict(pts).reshape(N, N)
+        P = model.predict(pts)
+    # robust reshape: (N*N,) or (N*N,1) -> (N,N)
+    if isinstance(P, np.ndarray):
+        P = P.squeeze()
+        P = P.reshape(N, N)
+    else:
+        P = np.array(P).squeeze().reshape(N, N)
     labels = {"z": ("x [m]", "y [m]"), "y": ("x [m]", "z [m]"), "x": ("y [m]", "z [m]")}[const_axis]
     if const_axis == "z": return X, Y, P, labels
     if const_axis == "y": return X, Z, P, labels
@@ -232,14 +238,21 @@ def residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000):
     dpdy = dde.grad.jacobian(yb, xb, i=0, j=1)
     dpdz = dde.grad.jacobian(yb, xb, i=0, j=2)
 
-    on_x = (xb[:, 0:1] == 0.0) | (xb[:, 0:1] == Lx)
-    on_y = (xb[:, 1:2] == 0.0) | (xb[:, 1:2] == Ly)
-    on_z = (xb[:, 2:3] == 0.0) | (xb[:, 2:3] == Lz)
-    nb = torch.where(on_x, dpdx, torch.zeros_like(dpdx)) \
-       + torch.where(on_y, dpdy, torch.zeros_like(dpdy)) \
-       + torch.where(on_z, dpdz, torch.zeros_like(dpdz))
+    # identify faces (robust)
+    x0, y0, z0 = xb[:, 0:1], xb[:, 1:2], xb[:, 2:3]
+    zero = torch.zeros(1, dtype=xb.dtype, device=xb.device)
+    Lx_t = torch.as_tensor(Lx, dtype=xb.dtype, device=xb.device)
+    Ly_t = torch.as_tensor(Ly, dtype=xb.dtype, device=xb.device)
+    Lz_t = torch.as_tensor(Lz, dtype=xb.dtype, device=xb.device)
+    on_x0 = torch.isclose(x0, zero); on_xL = torch.isclose(x0, Lx_t)
+    on_y0 = torch.isclose(y0, zero); on_yL = torch.isclose(y0, Ly_t)
+    on_z0 = torch.isclose(z0, zero); on_zL = torch.isclose(z0, Lz_t)
 
-    bc_rms = float(torch.sqrt(torch.mean(nb**2)).detach().cpu())
+    dpdn = torch.where(on_x0, -dpdx, torch.zeros_like(dpdx)) + torch.where(on_xL, dpdx, torch.zeros_like(dpdx)) \
+         + torch.where(on_y0, -dpdy, torch.zeros_like(dpdy)) + torch.where(on_yL, dpdy, torch.zeros_like(dpdy)) \
+         + torch.where(on_z0, -dpdz, torch.zeros_like(dpdz)) + torch.where(on_zL, dpdz, torch.zeros_like(dpdz))
+
+    bc_rms = float(torch.sqrt(torch.mean(dpdn**2)).detach().cpu())
     return pde_rms, bc_rms
 
 def vtk_structured_points_bytes(xg, yg, zg, P, name="pressure"):
@@ -356,34 +369,32 @@ if train_btn:
 
     # forcing term (Gaussian at user-chosen source position with optional carrier)
     def forcing_term(x: torch.Tensor) -> torch.Tensor:
-    # Gaussian envelope centered at the user source
-    xc = torch.tensor([src_x, src_y, src_z], dtype=x.dtype, device=x.device)
-    r2 = torch.sum((x - xc) ** 2, dim=1, keepdim=True)
-    gauss = torch.exp(-r2 / (2.0 * (src_sigma ** 2)))
-    amp_t = torch.as_tensor(src_gain, dtype=x.dtype, device=x.device)
+        xc = torch.tensor([src_x, src_y, src_z], dtype=x.dtype, device=x.device)
+        r2 = torch.sum((x - xc) ** 2, dim=1, keepdim=True)
+        gauss = torch.exp(-r2 / (2.0 * (src_sigma ** 2)))
+        amp_t = torch.as_tensor(src_gain, dtype=x.dtype, device=x.device)
 
-    # Carrier options
-    if carrier_type.startswith("Mode-aligned"):
-        Lx_t = torch.as_tensor(Lx, dtype=x.dtype, device=x.device)
-        Ly_t = torch.as_tensor(Ly, dtype=x.dtype, device=x.device)
-        Lz_t = torch.as_tensor(Lz, dtype=x.dtype, device=x.device)
-        nx_t = torch.as_tensor(nx, dtype=x.dtype, device=x.device)
-        ny_t = torch.as_tensor(ny, dtype=x.dtype, device=x.device)
-        nz_t = torch.as_tensor(nz, dtype=x.dtype, device=x.device)
-        carrier = (torch.cos(nx_t * np.pi * x[:, 0:1] / Lx_t) *
-                   torch.cos(ny_t * np.pi * x[:, 1:2] / Ly_t) *
-                   torch.cos(nz_t * np.pi * x[:, 2:3] / Lz_t))
-        return amp_t * carrier * gauss
+        if carrier_type.startswith("Mode-aligned"):
+            Lx_t = torch.as_tensor(Lx, dtype=x.dtype, device=x.device)
+            Ly_t = torch.as_tensor(Ly, dtype=x.dtype, device=x.device)
+            Lz_t = torch.as_tensor(Lz, dtype=x.dtype, device=x.device)
+            nx_t = torch.as_tensor(nx, dtype=x.dtype, device=x.device)
+            ny_t = torch.as_tensor(ny, dtype=x.dtype, device=x.device)
+            nz_t = torch.as_tensor(nz, dtype=x.dtype, device=x.device)
+            carrier = (torch.cos(nx_t * np.pi * x[:, 0:1] / Lx_t) *
+                       torch.cos(ny_t * np.pi * x[:, 1:2] / Ly_t) *
+                       torch.cos(nz_t * np.pi * x[:, 2:3] / Lz_t))
+            return amp_t * carrier * gauss
 
-    if carrier_type.startswith("Plane"):
-        k_t = torch.as_tensor(k, dtype=x.dtype, device=x.device)
-        carrier = (torch.cos(k_t * x[:, 0:1]) *
-                   torch.cos(k_t * x[:, 1:2]) *
-                   torch.cos(k_t * x[:, 2:3]))
-        return amp_t * carrier * gauss
+        if carrier_type.startswith("Plane"):
+            k_t = torch.as_tensor(k, dtype=x.dtype, device=x.device)
+            carrier = (torch.cos(k_t * x[:, 0:1]) *
+                       torch.cos(k_t * x[:, 1:2]) *
+                       torch.cos(k_t * x[:, 2:3]))
+            return amp_t * carrier * gauss
 
-    # "None" (or any unrecognized string): pure Gaussian monopole
-    return amp_t * gauss
+        # "None" (or any unrecognized string): pure Gaussian monopole
+        return amp_t * gauss
 
     # PDE residual
     def pde_residual(x, y):
@@ -420,11 +431,10 @@ if train_btn:
             alpha_t = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
             return dpdn + alpha_t * y  # Robin: ∂p/∂n + α p = 0
 
-    bc = dde.icbc.OperatorBC(dde.geometry.Cuboid([0,0,0],[Lx,Ly,Lz]), boundary_operator_bc,
-                             on_boundary=lambda x, on_b: on_b)
+    bc = dde.icbc.OperatorBC(geom, boundary_operator_bc, on_boundary=lambda _, on_b: on_b)
 
     data = dde.data.PDE(
-        dde.geometry.Cuboid([0.0, 0.0, 0.0], [Lx, Ly, Lz]),
+        geom,
         pde_residual, [bc],
         num_domain=int(n_int), num_boundary=int(n_bnd),
         train_distribution="pseudo",
@@ -505,14 +515,14 @@ if train_btn:
     fig.colorbar(pc, ax=ax, label="Re{p}")
     ax.set_xlabel(labels[0]); ax.set_ylabel(labels[1]); ax.set_title(f"{which}-mid slice")
 
-    # Overlay source + seat if on the shown plane
-    if which == "z" and abs(seat_z - const_val) < 1e-6:
+    # Overlay source + seat if on the shown plane (robust isclose)
+    if which == "z" and np.isclose(seat_z, const_val):
         ax.plot(src_x, src_y, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_x, seat_y, "wo", markersize=6, markeredgecolor="k")
-    elif which == "y" and abs(seat_y - const_val) < 1e-6:
+    elif which == "y" and np.isclose(seat_y, const_val):
         ax.plot(src_x, src_z, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_x, seat_z, "wo", markersize=6, markeredgecolor="k")
-    elif which == "x" and abs(seat_x - const_val) < 1e-6:
+    elif which == "x" and np.isclose(seat_x, const_val):
         ax.plot(src_y, src_z, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_y, seat_z, "wo", markersize=6, markeredgecolor="k")
 
