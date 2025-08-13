@@ -1,6 +1,6 @@
 streamlit==1.48.0
 numpy==2.3.2
 torch==2.8.0
-deepxde==1.14.0
+deepxde==1.8.4
 plotly==5.24.1
 matplotlib==3.10.5
