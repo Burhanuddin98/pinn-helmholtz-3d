@@ -1,4 +1,4 @@
-# app.py — PINN for 3D Helmholtz in a rectangular room
+# app.py — PINN for 3D Helmholtz in a rectangular room (step slider + live logs)
 # Works with: streamlit>=1.48, deepxde==1.14.0, torch>=2.2, numpy>=1.26, plotly>=5.24, matplotlib>=3.8
 # Run: streamlit run app.py
 
@@ -34,7 +34,6 @@ def seed_all(seed: int = 0):
     np.random.seed(seed)
     torch.manual_seed(seed)
     dde.config.set_random_seed(seed)
-
 seed_all(0)
 
 # ===================== UI =====================
@@ -98,7 +97,7 @@ with colB:
                             help="0 = rigid. Larger = more absorption.",
                             disabled=(wall_type=="Rigid (Neumann)"))
 
-    st.subheader("Training")
+    st.subheader("Training presets")
     quick = st.toggle("Quick mode (fast VM-friendly)", value=True)
     smoke_test = st.checkbox("Super-fast smoke test", value=False,
                              help="Tiny net & few points to confirm logs/plots.")
@@ -129,6 +128,23 @@ with colB:
         resample_every = 0
         Nplot_default = 48
         N3D_default, N3D_max = 32, 64
+
+    # --- User control over training length + update cadence ---
+    user_steps = st.slider(
+        "Training steps (Adam)", min_value=100, max_value=20000,
+        value=int(adam_iters), step=100,
+        help="Total optimization steps for Adam."
+    )
+    strict_steps = st.checkbox(
+        "Use exactly this many steps (no preset warmup minimum)",
+        value=True,
+        help="If off, a minimum warmup is enforced based on Quick toggle."
+    )
+    chunk_size = st.slider(
+        "UI update cadence (chunk size)", min_value=50, max_value=500,
+        value=200 if quick else 300, step=50,
+        help="Train in chunks so logs update during training."
+    )
 
     activation_key  = st.selectbox("Activation",  ["tanh", "sin", "relu"], index=0)
     initializer_key = st.selectbox("Initializer", ["Glorot uniform", "Glorot normal"], index=0)
@@ -184,7 +200,8 @@ def predict_plane(model: dde.Model, Lx, Ly, Lz, const_axis: str, const_val: floa
         raise ValueError("const_axis must be 'x','y','z'")
     model.net.eval()
     with torch.no_grad():
-        P = model.predict(pts).reshape(N, N)
+        P = model.predict(pts)
+    P = np.array(P).squeeze().reshape(N, N)
     labels = {"z": ("x [m]", "y [m]"), "y": ("x [m]", "z [m]"), "x": ("y [m]", "z [m]")}[const_axis]
     if const_axis == "z": return X, Y, P, labels
     if const_axis == "y": return X, Z, P, labels
@@ -271,8 +288,7 @@ def render_plotly_3d(xg, yg, zg, P, mode="Isosurface", use_abs=False, surf_count
     hi_p = float(np.percentile(V, 100 - tail))
     Vc = np.clip(V, lo_p, hi_p)
     if sym_zero:
-        rng = float(np.max(np.abs(Vc)))
-        lo, hi = -rng, rng
+        rng = float(np.max(np.abs(Vc))); lo, hi = -rng, rng
     else:
         lo, hi = lo_p, hi_p
         if lo == hi: hi = lo + 1e-6
@@ -369,6 +385,19 @@ if train_btn:
             ny_t = torch.as_tensor(ny, dtype=x.dtype, device=x.device)
             nz_t = torch.as_tensor(nz, dtype=x.dtype, device=x.device)
             carrier = (torch.cos(nx_t * np.pi * x[:, 0:1] / Lx_t) *
+                       torch.cos(ny_t * np.pi * x[:, 1:2]) / Ly_t *
+                       torch.cos(nz_t * np.pi * x[:, 2:3]) / Lz_t)
+            # Oops — fixed below. Keep the correct line instead:
+            # (leave the above line to show intent if you had it already)
+        # Correct carrier (mode-aligned):
+        if carrier_type.startswith("Mode-aligned"):
+            Lx_t = torch.as_tensor(Lx, dtype=x.dtype, device=x.device)
+            Ly_t = torch.as_tensor(Ly, dtype=x.dtype, device=x.device)
+            Lz_t = torch.as_tensor(Lz, dtype=x.dtype, device=x.device)
+            nx_t = torch.as_tensor(nx, dtype=x.dtype, device=x.device)
+            ny_t = torch.as_tensor(ny, dtype=x.dtype, device=x.device)
+            nz_t = torch.as_tensor(nz, dtype=x.dtype, device=x.device)
+            carrier = (torch.cos(nx_t * np.pi * x[:, 0:1] / Lx_t) *
                        torch.cos(ny_t * np.pi * x[:, 1:2] / Ly_t) *
                        torch.cos(nz_t * np.pi * x[:, 2:3] / Lz_t))
             return amp_t * carrier * gauss
@@ -379,6 +408,9 @@ if train_btn:
                        torch.cos(k_t * x[:, 1:2]) *
                        torch.cos(k_t * x[:, 2:3]))
             return amp_t * carrier * gauss
+
+        # "None": pure Gaussian
+        return amp_t * gauss
 
     # PDE residual
     def pde_residual(x, y):
@@ -443,21 +475,47 @@ if train_btn:
     if resample_every:
         callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
 
-    # -------- Stage 1: Adam warm-up --------
-    adam_iters_warmup = max(800 if quick else 3000, int(adam_iters))
+    # -------- Stage 1: Adam (chunked with live logs + step slider) --------
+    total_steps = int(user_steps) if strict_steps else max(800 if quick else 3000, int(user_steps))
     buf = io.StringIO()
+    total_done = 0
     try:
         with st.status("Training (Adam)…", expanded=False) as st_status:
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(buf):
                 model.compile("adam", lr=adam_lr, loss_weights=[1.0, bc_weight])
-                model.train(
-                    iterations=int(adam_iters_warmup),
-                    callbacks=callbacks_adam,
-                    display_every=100,
-                )
+                remaining = int(total_steps)
+                while remaining > 0:
+                    step = int(min(chunk_size, remaining))
+                    hist, train_state = model.train(
+                        iterations=step,
+                        callbacks=callbacks_adam,
+                        display_every=min(100, step),
+                    )
+                    remaining -= step
+                    total_done += step
+
+                    # Last loss from this chunk
+                    try:
+                        last = hist.loss_train[-1] if hist and hist.loss_train else None
+                        loss_str = " + ".join(f"{float(x):.3e}" for x in last) if last is not None else "n/a"
+                    except Exception:
+                        loss_str = "n/a"
+
+                    # Quick residual check so you see motion
+                    try:
+                        pde_chk, bc_chk = residual_rms(
+                            model, Lx, Ly, Lz, k, forcing_term,
+                            N=1200 if (quick or smoke_test) else 2000
+                        )
+                    except Exception:
+                        pde_chk, bc_chk = float("nan"), float("nan")
+
+                    st.session_state["log"] += f"[{total_done:5d}] loss={loss_str} | PDE_RMS={pde_chk:.3e} BC_RMS={bc_chk:.3e}\n"
+                    log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+
             dt = time.perf_counter() - t0
-            st_status.update(label=f"Adam complete in {dt:.1f}s", state="complete")
+            st_status.update(label=f"Adam finished {total_done} steps in {dt:.1f}s", state="complete")
     except Exception as e:
         st.exception(e)
     finally:
