@@ -105,7 +105,7 @@ with colB:
 
     if quick:
         width, depth = 64, 2
-        adam_lr, adam_iters = 2e-3, 1200
+        adam_lr, adam_iters = 2e-3, 100
         n_int, n_bnd = 3000, 1000
         display_every = 200
         resample_every = 0
