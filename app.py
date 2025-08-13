@@ -1,4 +1,4 @@
-# app.py — PINN for 3D Helmholtz in a rectangular room
+# app.py — PINN for 3D Helmholtz in a rectangular room (with step slider + live logs)
 # Works with: streamlit>=1.48, deepxde==1.14.0, torch>=2.2, numpy>=1.26, plotly>=5.24, matplotlib>=3.8
 # Run: streamlit run app.py
 
@@ -20,12 +20,7 @@ OUTDIR = pathlib.Path.cwd() / "runs"
 OUTDIR.mkdir(exist_ok=True)
 def run_tag() -> str: return time.strftime("%Y%m%d-%H%M%S")
 
-# init session state early (before widgets)
-for k, v in [
-    ("log", ""),
-    ("model", None),
-    ("last_tag", ""),
-]:
+for k, v in [("log",""), ("model",None), ("last_tag","")]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -34,12 +29,12 @@ def seed_all(seed: int = 0):
     np.random.seed(seed)
     torch.manual_seed(seed)
     dde.config.set_random_seed(seed)
-
 seed_all(0)
 
 # ===================== UI =====================
 st.set_page_config(page_title="PINN Helmholtz 3D (Room Modes)", layout="wide")
 st.title("PINN Helmholtz 3D — Room Sound Map")
+st.caption(f"PyTorch {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
 
 colA, colB = st.columns([2, 1], gap="large")
 
@@ -98,7 +93,7 @@ with colB:
                             help="0 = rigid. Larger = more absorption.",
                             disabled=(wall_type=="Rigid (Neumann)"))
 
-    st.subheader("Training")
+    st.subheader("Training presets")
     quick = st.toggle("Quick mode (fast VM-friendly)", value=True)
     smoke_test = st.checkbox("Super-fast smoke test", value=False,
                              help="Tiny net & few points to confirm logs/plots.")
@@ -129,6 +124,23 @@ with colB:
         resample_every = 0
         Nplot_default = 48
         N3D_default, N3D_max = 32, 64
+
+    # --- User control over training length + update cadence ---
+    user_steps = st.slider(
+        "Training steps (Adam)", min_value=100, max_value=20000,
+        value=int(adam_iters), step=100,
+        help="Total optimization steps for Adam."
+    )
+    strict_steps = st.checkbox(
+        "Use exactly this many steps (no preset warmup minimum)",
+        value=True,
+        help="If off, a minimum warmup is enforced based on Quick toggle."
+    )
+    chunk_size = st.slider(
+        "UI update cadence (chunk size)", min_value=50, max_value=500,
+        value=200 if quick else 300, step=50,
+        help="Train in chunks so logs update during training."
+    )
 
     activation_key  = st.selectbox("Activation",  ["tanh", "sin", "relu"], index=0)
     initializer_key = st.selectbox("Initializer", ["Glorot uniform", "Glorot normal"], index=0)
@@ -184,7 +196,8 @@ def predict_plane(model: dde.Model, Lx, Ly, Lz, const_axis: str, const_val: floa
         raise ValueError("const_axis must be 'x','y','z'")
     model.net.eval()
     with torch.no_grad():
-        P = model.predict(pts).reshape(N, N)
+        P = model.predict(pts)
+    P = np.array(P).squeeze().reshape(N, N)  # robust reshape (handles (N*N,1) or (N*N,))
     labels = {"z": ("x [m]", "y [m]"), "y": ("x [m]", "z [m]"), "x": ("y [m]", "z [m]")}[const_axis]
     if const_axis == "z": return X, Y, P, labels
     if const_axis == "y": return X, Z, P, labels
@@ -232,14 +245,21 @@ def residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000):
     dpdy = dde.grad.jacobian(yb, xb, i=0, j=1)
     dpdz = dde.grad.jacobian(yb, xb, i=0, j=2)
 
-    on_x = (xb[:, 0:1] == 0.0) | (xb[:, 0:1] == Lx)
-    on_y = (xb[:, 1:2] == 0.0) | (xb[:, 1:2] == Ly)
-    on_z = (xb[:, 2:3] == 0.0) | (xb[:, 2:3] == Lz)
-    nb = torch.where(on_x, dpdx, torch.zeros_like(dpdx)) \
-       + torch.where(on_y, dpdy, torch.zeros_like(dpdy)) \
-       + torch.where(on_z, dpdz, torch.zeros_like(dpdz))
+    # robust face identification with isclose
+    x0, y0, z0 = xb[:, 0:1], xb[:, 1:2], xb[:, 2:3]
+    zero = torch.zeros(1, dtype=xb.dtype, device=xb.device)
+    Lx_t = torch.as_tensor(Lx, dtype=xb.dtype, device=xb.device)
+    Ly_t = torch.as_tensor(Ly, dtype=xb.dtype, device=xb.device)
+    Lz_t = torch.as_tensor(Lz, dtype=xb.dtype, device=xb.device)
+    on_x0 = torch.isclose(x0, zero); on_xL = torch.isclose(x0, Lx_t)
+    on_y0 = torch.isclose(y0, zero); on_yL = torch.isclose(y0, Ly_t)
+    on_z0 = torch.isclose(z0, zero); on_zL = torch.isclose(z0, Lz_t)
 
-    bc_rms = float(torch.sqrt(torch.mean(nb**2)).detach().cpu())
+    dpdn = torch.where(on_x0, -dpdx, torch.zeros_like(dpdx)) + torch.where(on_xL, dpdx, torch.zeros_like(dpdx)) \
+         + torch.where(on_y0, -dpdy, torch.zeros_like(dpdy)) + torch.where(on_yL, dpdy, torch.zeros_like(dpdy)) \
+         + torch.where(on_z0, -dpdz, torch.zeros_like(dpdz)) + torch.where(on_zL, dpdz, torch.zeros_like(dpdz))
+
+    bc_rms = float(torch.sqrt(torch.mean(dpdn**2)).detach().cpu())
     return pde_rms, bc_rms
 
 def vtk_structured_points_bytes(xg, yg, zg, P, name="pressure"):
@@ -271,8 +291,7 @@ def render_plotly_3d(xg, yg, zg, P, mode="Isosurface", use_abs=False, surf_count
     hi_p = float(np.percentile(V, 100 - tail))
     Vc = np.clip(V, lo_p, hi_p)
     if sym_zero:
-        rng = float(np.max(np.abs(Vc)))
-        lo, hi = -rng, rng
+        rng = float(np.max(np.abs(Vc))); lo, hi = -rng, rng
     else:
         lo, hi = lo_p, hi_p
         if lo == hi: hi = lo + 1e-6
@@ -380,6 +399,9 @@ if train_btn:
                        torch.cos(k_t * x[:, 2:3]))
             return amp_t * carrier * gauss
 
+        # "None" (or any unrecognized string): pure Gaussian monopole
+        return amp_t * gauss
+
     # PDE residual
     def pde_residual(x, y):
         dxx = dde.grad.hessian(y, x, i=0, j=0)
@@ -415,11 +437,10 @@ if train_btn:
             alpha_t = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
             return dpdn + alpha_t * y  # Robin: ∂p/∂n + α p = 0
 
-    bc = dde.icbc.OperatorBC(dde.geometry.Cuboid([0,0,0],[Lx,Ly,Lz]), boundary_operator_bc,
-                             on_boundary=lambda x, on_b: on_b)
+    bc = dde.icbc.OperatorBC(geom, boundary_operator_bc, on_boundary=lambda _, on_b: on_b)
 
     data = dde.data.PDE(
-        dde.geometry.Cuboid([0.0, 0.0, 0.0], [Lx, Ly, Lz]),
+        geom,
         pde_residual, [bc],
         num_domain=int(n_int), num_boundary=int(n_bnd),
         train_distribution="pseudo",
@@ -439,25 +460,54 @@ if train_btn:
         save_better_only=False,
         period=int(max(50, display_every))
     )
-    callbacks_adam = [ckpt]
+
+    # -------- Stage 1: Adam (chunked with live logs) --------
+    losshist = dde.callbacks.LossHistory()
+    callbacks_adam = [ckpt, losshist]
     if resample_every:
         callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
 
-    # -------- Stage 1: Adam warm-up --------
-    adam_iters_warmup = max(800 if quick else 3000, int(adam_iters))
+    # Decide total steps based on slider + preset
+    adam_iters_warmup = int(user_steps) if strict_steps else max(800 if quick else 3000, int(user_steps))
+
     buf = io.StringIO()
+    total = 0
     try:
         with st.status("Training (Adam)…", expanded=False) as st_status:
             t0 = time.perf_counter()
             with contextlib.redirect_stdout(buf):
                 model.compile("adam", lr=adam_lr, loss_weights=[1.0, bc_weight])
-                model.train(
-                    iterations=int(adam_iters_warmup),
-                    callbacks=callbacks_adam,
-                    display_every=100,
-                )
+                remaining = int(adam_iters_warmup)
+                while remaining > 0:
+                    step = int(min(chunk_size, remaining))
+                    model.train(iterations=step, callbacks=callbacks_adam, display_every=min(100, step))
+                    remaining -= step
+                    total += step
+
+                    # quick residual check on a modest sample so you see movement
+                    try:
+                        pde_chk, bc_chk = residual_rms(
+                            model, Lx, Ly, Lz, k, forcing_term,
+                            N=1200 if quick or smoke_test else 2000
+                        )
+                    except Exception:
+                        pde_chk, bc_chk = float("nan"), float("nan")
+
+                    # format last train loss (can be list)
+                    if losshist.loss_train:
+                        last = losshist.loss_train[-1]
+                        try:
+                            loss_str = " + ".join(f"{float(x):.3e}" for x in last)
+                        except Exception:
+                            loss_str = str(last)
+                    else:
+                        loss_str = "n/a"
+
+                    st.session_state["log"] += f"[{total:5d}] loss={loss_str} | PDE_RMS={pde_chk:.3e} BC_RMS={bc_chk:.3e}\n"
+                    log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+
             dt = time.perf_counter() - t0
-            st_status.update(label=f"Adam complete in {dt:.1f}s", state="complete")
+            st_status.update(label=f"Adam finished {total} steps in {dt:.1f}s", state="complete")
     except Exception as e:
         st.exception(e)
     finally:
@@ -482,9 +532,9 @@ if train_btn:
             st.session_state["log"] += buf2.getvalue()
             log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
 
-    # residual metrics
+    # residual metrics (final)
     try:
-        pde_rms, bc_rms = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000)
+        pde_rms, bc_rms = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000 if not smoke_test else 2000)
         st.session_state["log"] += f"\nPDE residual RMS: {pde_rms:.3e}   BC residual RMS: {bc_rms:.3e}\n"
         log_box.text_area("Logs", st.session_state["log"], height=260, disabled=True)
     except Exception as e:
@@ -500,14 +550,14 @@ if train_btn:
     fig.colorbar(pc, ax=ax, label="Re{p}")
     ax.set_xlabel(labels[0]); ax.set_ylabel(labels[1]); ax.set_title(f"{which}-mid slice")
 
-    # Overlay source + seat if on the shown plane
-    if which == "z" and abs(seat_z - const_val) < 1e-6:
+    # Overlay source + seat if on the shown plane (robust)
+    if which == "z" and np.isclose(seat_z, const_val):
         ax.plot(src_x, src_y, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_x, seat_y, "wo", markersize=6, markeredgecolor="k")
-    elif which == "y" and abs(seat_y - const_val) < 1e-6:
+    elif which == "y" and np.isclose(seat_y, const_val):
         ax.plot(src_x, src_z, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_x, seat_z, "wo", markersize=6, markeredgecolor="k")
-    elif which == "x" and abs(seat_x - const_val) < 1e-6:
+    elif which == "x" and np.isclose(seat_x, const_val):
         ax.plot(src_y, src_z, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_y, seat_z, "wo", markersize=6, markeredgecolor="k")
 
