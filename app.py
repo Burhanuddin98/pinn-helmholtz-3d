@@ -1,5 +1,5 @@
-# app.py — Streamlit PINN for 3D Helmholtz (Rigid / Neumann room) + 3D viz
-# Python 3.10; numpy 1.26.x; torch 2.2.x (CPU ok); deepxde 1.8.4; streamlit; plotly
+# app.py — Streamlit PINN for 3D Helmholtz (Rigid/Neumann or Slightly Absorbing/Robin) + 3D viz + probes
+# Python 3.10+; numpy 1.26+; torch 2.2+ (CPU ok); deepxde 1.8.4+; streamlit; plotly
 # Run: streamlit run app.py
 
 import os, io, time, pathlib, contextlib
@@ -11,7 +11,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 import deepxde as dde
-from deepxde.backend import torch as bkd  # noqa: F401
+from deepxde.backend import torch as bkd  # noqa: F401 (ensures PyTorch backend)
 import torch
 import plotly.graph_objects as go
 
@@ -36,17 +36,17 @@ def seed_all(seed: int = 0):
 seed_all(0)
 
 # ===================== UI =====================
-st.set_page_config(page_title="PINN Helmholtz 3D (Rigid Room)", layout="wide")
-st.title("PINN Helmholtz 3D — Rigid Room (Helmholtz PDE)")
+st.set_page_config(page_title="PINN Helmholtz 3D (Room Modes)", layout="wide")
+st.title("PINN Helmholtz 3D — Room Sound Map (Helmholtz PDE)")
 
 colA, colB = st.columns([2, 1], gap="large")
 
 with colB:
-    st.subheader("Room & Source")
+    st.subheader("Room & Sound")
     c  = st.number_input("Speed of sound c [m/s]", 300.0, 380.0, 343.0, 1.0)
-    Lx = st.number_input("Room length Lx [m]",     1.0,  20.0, 5.0,   0.1)
-    Ly = st.number_input("Room width  Ly [m]",     1.0,  20.0, 4.0,   0.1)
-    Lz = st.number_input("Room height Lz [m]",     1.0,  20.0, 3.0,   0.1)
+    Lx = st.number_input("Room length Lx [m]",     1.0,  30.0, 5.0,   0.1)
+    Ly = st.number_input("Room width  Ly [m]",     1.0,  30.0, 4.0,   0.1)
+    Lz = st.number_input("Room height Lz [m]",     1.0,  15.0, 3.0,   0.1)
 
     f = st.number_input("Frequency f [Hz]", 10.0, 800.0, 100.0, 1.0)
     omega = 2.0 * np.pi * f
@@ -57,7 +57,7 @@ with colB:
     src_sigma  = st.number_input("Sigma [m]", 0.05, 1.00, 0.30, 0.01)
     src_gain   = st.number_input("Gain (amplitude)", 0.1, 50.0, 2.0, 0.1)
 
-    st.markdown("**Carrier**")
+    st.markdown("**Carrier (helps reveal clean patterns)**")
     carrier_type = st.selectbox(
         "Carrier type",
         ["Mode-aligned cos(nₓπx/Lx)·cos(nᵧπy/Ly)·cos(n_zπz/Lz)", "Plane cos(kx)cos(ky)cos(kz)", "None"],
@@ -68,7 +68,18 @@ with colB:
         ny = int(st.number_input("nᵧ", 0, 12, 0, 1))
         nz = int(st.number_input("n_z", 0, 12, 0, 1))
         f_mode = (c / 2.0) * np.sqrt((nx / Lx) ** 2 + (ny / Ly) ** 2 + (nz / Lz) ** 2)
-        st.caption(f"Eigenmode freq for ({nx},{ny},{nz}) ≈ {f_mode:.2f} Hz — set f near this.")
+        st.caption(f"Eigenmode hint for ({nx},{ny},{nz}) ≈ {f_mode:.2f} Hz — set f near this.")
+
+    st.markdown("**Source position**")
+    src_x = st.slider("Source x [m]", 0.0, Lx, Lx/2.0, 0.05)
+    src_y = st.slider("Source y [m]", 0.0, Ly, Ly/2.0, 0.05)
+    src_z = st.slider("Source z [m]", 0.0, Lz, Lz/2.0, 0.05)
+
+    st.subheader("Walls")
+    wall_type = st.selectbox("Boundary type", ["Rigid (Neumann)", "Slightly absorbing (Robin)"], index=0)
+    alpha = st.number_input("Absorption strength α [1/m]", 0.0, 5.0, 0.2, 0.05,
+                            help="0 = rigid. Larger = more absorption.",
+                            disabled=(wall_type=="Rigid (Neumann)"))
 
     st.subheader("Training")
     quick = st.toggle("Quick mode (fast VM-friendly)", value=True)
@@ -103,7 +114,7 @@ with colB:
     viz_type = st.selectbox("3D view", ["Isosurface", "Volume"], index=0)
     use_abs = st.checkbox("Plot |p| (magnitude) instead of Re{p}", value=False)
 
-    # Robust 3D display controls
+    # Robust viz controls
     sym_zero = st.checkbox("Symmetric range about 0", value=True,
                            help="Range set to [-A,+A] with A=max|p| (after optional de-meaning).")
     clip_mid_pct = st.slider("Keep middle % of values (clip tails)", 50, 99, 90, 1,
@@ -120,6 +131,11 @@ with colB:
         vol_opacity = st.slider("Volume max opacity", 0.05, 1.00, 0.25, 0.05)
         surf_count = 3
         iso_opacity = 0.60
+
+    st.subheader("Probes")
+    seat_x = st.slider("Seat x [m]", 0.0, Lx, Lx*0.6, 0.05)
+    seat_y = st.slider("Seat y [m]", 0.0, Ly, Ly*0.5, 0.05)
+    seat_z = st.slider("Seat z [m]", 0.0, Lz, min(Lz*0.5, 1.2), 0.05, help="Ear height ~1.2 m if Lz≈2.4")
 
 with colA:
     st.subheader("Console")
@@ -325,9 +341,9 @@ if train_btn:
     torch.set_num_threads(int(os.getenv("OMP_NUM_THREADS", "4")))
     geom = dde.geometry.Cuboid([0.0, 0.0, 0.0], [Lx, Ly, Lz])
 
-    # forcing term (Gaussian at center with optional carrier)
+    # forcing term (Gaussian at user-chosen source position with optional carrier)
     def forcing_term(x: torch.Tensor) -> torch.Tensor:
-        xc = torch.tensor([Lx/2.0, Ly/2.0, Lz/2.0], dtype=x.dtype, device=x.device)
+        xc = torch.tensor([src_x, src_y, src_z], dtype=x.dtype, device=x.device)
         r2 = torch.sum((x - xc) ** 2, dim=1, keepdim=True)
         gauss = torch.exp(-r2 / (2.0 * (src_sigma ** 2)))
         amp_t = torch.as_tensor(src_gain, dtype=x.dtype, device=x.device)
@@ -361,8 +377,8 @@ if train_btn:
         lap = dxx + dyy + dzz
         return lap + (k ** 2) * y - forcing_term(x)
 
-    # Neumann BC via OperatorBC
-    def neumann_operator_bc(x, y, _):
+    # Unified boundary operator: Neumann (rigid) or Robin (slightly absorbing)
+    def boundary_operator_bc(x, y, _):
         dpdx = dde.grad.jacobian(y, x, i=0, j=0)
         dpdy = dde.grad.jacobian(y, x, i=0, j=1)
         dpdz = dde.grad.jacobian(y, x, i=0, j=2)
@@ -371,19 +387,26 @@ if train_btn:
         Lx_t = torch.as_tensor(Lx, dtype=x.dtype, device=x.device)
         Ly_t = torch.as_tensor(Ly, dtype=x.dtype, device=x.device)
         Lz_t = torch.as_tensor(Lz, dtype=x.dtype, device=x.device)
-        on_x = torch.isclose(x0, zero) | torch.isclose(x0, Lx_t)
-        on_y = torch.isclose(y0, zero) | torch.isclose(y0, Ly_t)
-        on_z = torch.isclose(z0, zero) | torch.isclose(z0, Lz_t)
-        res = torch.zeros_like(y)
-        res = res + torch.where(on_x, dpdx, torch.zeros_like(dpdx))
-        res = res + torch.where(on_y, dpdy, torch.zeros_like(dpdy))
-        res = res + torch.where(on_z, dpdz, torch.zeros_like(dpdz))
-        return res
 
-    rigid_bc = dde.icbc.OperatorBC(geom, neumann_operator_bc, on_boundary=lambda x, on_b: on_b)
+        on_x0 = torch.isclose(x0, zero); on_xL = torch.isclose(x0, Lx_t)
+        on_y0 = torch.isclose(y0, zero); on_yL = torch.isclose(y0, Ly_t)
+        on_z0 = torch.isclose(z0, zero); on_zL = torch.isclose(z0, Lz_t)
+
+        # outward normal derivative on each face
+        dpdn = torch.where(on_x0, -dpdx, torch.zeros_like(dpdx)) + torch.where(on_xL, dpdx, torch.zeros_like(dpdx)) \
+             + torch.where(on_y0, -dpdy, torch.zeros_like(dpdy)) + torch.where(on_yL, dpdy, torch.zeros_like(dpdy)) \
+             + torch.where(on_z0, -dpdz, torch.zeros_like(dpdz)) + torch.where(on_zL, dpdz, torch.zeros_like(dpdz))
+
+        if wall_type == "Rigid (Neumann)":
+            return dpdn
+        else:
+            alpha_t = torch.as_tensor(alpha, dtype=x.dtype, device=x.device)
+            return dpdn + alpha_t * y
+
+    bc = dde.icbc.OperatorBC(geom, boundary_operator_bc, on_boundary=lambda x, on_b: on_b)
 
     data = dde.data.PDE(
-        geom, pde_residual, [rigid_bc],
+        geom, pde_residual, [bc],
         num_domain=int(n_int), num_boundary=int(n_bnd),
         train_distribution="pseudo",
     )
@@ -426,20 +449,48 @@ if train_btn:
     A, B, P2, labels = predict_plane(model, Lx, Ly, Lz, which, const_val, N=Nplot)
     fig, ax = plt.subplots(figsize=(8, 4))
     pc = ax.pcolormesh(A, B, P2, shading="auto")
-    fig.colorbar(pc, ax=ax, label="Re{p}")
+    cbar = fig.colorbar(pc, ax=ax, label="Re{p}")
     ax.set_xlabel(labels[0]); ax.set_ylabel(labels[1]); ax.set_title(f"{which}-mid slice")
+
+    # Seat probe overlay if it lies on the shown mid-plane
+    overlayed = False
+    if which == "z" and abs(seat_z - const_val) < 1e-6:
+        ax.plot(src_x, src_y, "wx", markersize=6, markeredgecolor="k")  # source mark
+        ax.plot(seat_x, seat_y, "wo", markersize=6, markeredgecolor="k")  # seat mark
+        overlayed = True
+    elif which == "y" and abs(seat_y - const_val) < 1e-6:
+        ax.plot(src_x, src_z, "wx", markersize=6, markeredgecolor="k")
+        ax.plot(seat_x, seat_z, "wo", markersize=6, markeredgecolor="k")
+        overlayed = True
+    elif which == "x" and abs(seat_x - const_val) < 1e-6:
+        ax.plot(src_y, src_z, "wx", markersize=6, markeredgecolor="k")
+        ax.plot(seat_y, seat_z, "wo", markersize=6, markeredgecolor="k")
+        overlayed = True
+
     plot_placeholder.pyplot(fig); plt.close(fig)
 
+    # Probe the trained model at the seat location
+    with torch.no_grad():
+        p_seat = float(model.predict(np.array([[seat_x, seat_y, seat_z]], dtype=np.float32))[0, 0])
+    seat_msg = f"Seat probe @ ({seat_x:.2f},{seat_y:.2f},{seat_z:.2f}) m → p ≈ {p_seat:.3e}"
+    if overlayed:
+        info_placeholder.info(seat_msg)
+    else:
+        info_placeholder.info(seat_msg + " (seat not on shown mid-plane)")
+
+    # save slice & downloadable
     out_npz = OUTDIR / f"slice_{which}mid-{tag}.npz"
-    np.savez(out_npz, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k)
-    info_placeholder.success(f"Saved slice → {out_npz.name} (in runs/)")
-    buf_npz = io.BytesIO()
-    np.savez(buf_npz, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k)
+    np.savez(out_npz, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k,
+             src=(src_x, src_y, src_z), seat=(seat_x, seat_y, seat_z),
+             wall_type=wall_type, alpha=alpha)
+    dl_buf = io.BytesIO()
+    np.savez(dl_buf, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k,
+             src=(src_x, src_y, src_z), seat=(seat_x, seat_y, seat_z),
+             wall_type=wall_type, alpha=alpha)
     dl_placeholder.download_button(
-        "Download slice (.npz)", data=buf_npz.getvalue(),
+        "Download slice (.npz)", data=dl_buf.getvalue(),
         file_name=out_npz.name, mime="application/octet-stream",
     )
-
     st.session_state["model"] = model
     st.session_state["last_tag"] = tag
 
@@ -456,6 +507,10 @@ if render3d_btn:
         st.warning("Train the PINN first — no model in session.")
     else:
         model = st.session_state["model"]
+        # Recompute seat probe on demand too
+        with torch.no_grad():
+            p_seat = float(model.predict(np.array([[seat_x, seat_y, seat_z]], dtype=np.float32))[0, 0])
+        info_placeholder.info(f"(Re)computed seat probe → p ≈ {p_seat:.3e}")
         compute_and_show_3d(
             model, Lx, Ly, Lz, N3D, viz_type, use_abs, surf_count, iso_opacity,
             vol_surfaces, vol_opacity, sym_zero, clip_mid_pct, demean_for_viz,
