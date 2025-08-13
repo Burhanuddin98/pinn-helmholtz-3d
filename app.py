@@ -356,29 +356,34 @@ if train_btn:
 
     # forcing term (Gaussian at user-chosen source position with optional carrier)
     def forcing_term(x: torch.Tensor) -> torch.Tensor:
-        xc = torch.tensor([src_x, src_y, src_z], dtype=x.dtype, device=x.device)
-        r2 = torch.sum((x - xc) ** 2, dim=1, keepdim=True)
-        gauss = torch.exp(-r2 / (2.0 * (src_sigma ** 2)))
-        amp_t = torch.as_tensor(src_gain, dtype=x.dtype, device=x.device)
+    # Gaussian envelope centered at the user source
+    xc = torch.tensor([src_x, src_y, src_z], dtype=x.dtype, device=x.device)
+    r2 = torch.sum((x - xc) ** 2, dim=1, keepdim=True)
+    gauss = torch.exp(-r2 / (2.0 * (src_sigma ** 2)))
+    amp_t = torch.as_tensor(src_gain, dtype=x.dtype, device=x.device)
 
-        if carrier_type.startswith("Mode-aligned"):
-            Lx_t = torch.as_tensor(Lx, dtype=x.dtype, device=x.device)
-            Ly_t = torch.as_tensor(Ly, dtype=x.dtype, device=x.device)
-            Lz_t = torch.as_tensor(Lz, dtype=x.dtype, device=x.device)
-            nx_t = torch.as_tensor(nx, dtype=x.dtype, device=x.device)
-            ny_t = torch.as_tensor(ny, dtype=x.dtype, device=x.device)
-            nz_t = torch.as_tensor(nz, dtype=x.dtype, device=x.device)
-            carrier = (torch.cos(nx_t * np.pi * x[:, 0:1] / Lx_t) *
-                       torch.cos(ny_t * np.pi * x[:, 1:2] / Ly_t) *
-                       torch.cos(nz_t * np.pi * x[:, 2:3] / Lz_t))
-            return amp_t * carrier * gauss
+    # Carrier options
+    if carrier_type.startswith("Mode-aligned"):
+        Lx_t = torch.as_tensor(Lx, dtype=x.dtype, device=x.device)
+        Ly_t = torch.as_tensor(Ly, dtype=x.dtype, device=x.device)
+        Lz_t = torch.as_tensor(Lz, dtype=x.dtype, device=x.device)
+        nx_t = torch.as_tensor(nx, dtype=x.dtype, device=x.device)
+        ny_t = torch.as_tensor(ny, dtype=x.dtype, device=x.device)
+        nz_t = torch.as_tensor(nz, dtype=x.dtype, device=x.device)
+        carrier = (torch.cos(nx_t * np.pi * x[:, 0:1] / Lx_t) *
+                   torch.cos(ny_t * np.pi * x[:, 1:2] / Ly_t) *
+                   torch.cos(nz_t * np.pi * x[:, 2:3] / Lz_t))
+        return amp_t * carrier * gauss
 
-        if carrier_type.startswith("Plane"):
-            k_t = torch.as_tensor(k, dtype=x.dtype, device=x.device)
-            carrier = (torch.cos(k_t * x[:, 0:1]) *
-                       torch.cos(k_t * x[:, 1:2]) *
-                       torch.cos(k_t * x[:, 2:3]))
-            return amp_t * carrier * gauss
+    if carrier_type.startswith("Plane"):
+        k_t = torch.as_tensor(k, dtype=x.dtype, device=x.device)
+        carrier = (torch.cos(k_t * x[:, 0:1]) *
+                   torch.cos(k_t * x[:, 1:2]) *
+                   torch.cos(k_t * x[:, 2:3]))
+        return amp_t * carrier * gauss
+
+    # "None" (or any unrecognized string): pure Gaussian monopole
+    return amp_t * gauss
 
     # PDE residual
     def pde_residual(x, y):
