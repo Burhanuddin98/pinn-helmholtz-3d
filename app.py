@@ -33,7 +33,6 @@ def seed_all(seed: int = 0):
 
 seed_all(0)
 # IMPORTANT: use forward-mode to avoid reverse-mode Hessian cache bugs
-dde.config.set_autodiff("forward")
 
 # ===================== UI =====================
 st.set_page_config(page_title="PINN Helmholtz 3D (Room Modes)", layout="wide")
