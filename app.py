@@ -1,4 +1,5 @@
-# app.py — Streamlit PINN for 3D Helmholtz (Rigid/Neumann or Slightly Absorbing/Robin) + 3D viz + probes
+# app.py — Streamlit PINN for 3D Helmholtz (Rigid/Neumann or Slightly Absorbing/Robin)
+# + 3D viz + probes + robust training/logging
 # Python 3.10+; numpy 1.26+; torch 2.2+ (CPU ok); deepxde 1.8.4+; streamlit; plotly
 # Run: streamlit run app.py
 
@@ -11,7 +12,7 @@ import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 import deepxde as dde
-from deepxde.backend import torch as bkd  # noqa: F401 (ensures PyTorch backend)
+from deepxde.backend import torch as bkd  # noqa: F401 (ensures PyTorch backend import)
 import torch
 import plotly.graph_objects as go
 
@@ -20,26 +21,39 @@ OUTDIR = pathlib.Path.cwd() / "runs"
 OUTDIR.mkdir(exist_ok=True)
 def run_tag() -> str: return time.strftime("%Y%m%d-%H%M%S")
 
-if "log" not in st.session_state:
-    st.session_state["log"] = ""
-if "model" not in st.session_state:
-    st.session_state["model"] = None
-if "last_tag" not in st.session_state:
-    st.session_state["last_tag"] = ""
+if "log" not in st.session_state: st.session_state["log"] = ""
+if "model" not in st.session_state: st.session_state["model"] = None
+if "last_tag" not in st.session_state: st.session_state["last_tag"] = ""
 
-# ---------------- determinism ----------------
+# ---------------- determinism + stable autodiff ----------------
 def seed_all(seed: int = 0):
     np.random.seed(seed)
     torch.manual_seed(seed)
     dde.config.set_random_seed(seed)
 
 seed_all(0)
+# IMPORTANT: use forward-mode to avoid reverse-mode Hessian cache bugs
+dde.config.set_autodiff("forward")
 
 # ===================== UI =====================
 st.set_page_config(page_title="PINN Helmholtz 3D (Room Modes)", layout="wide")
 st.title("PINN Helmholtz 3D — Room Sound Map (Helmholtz PDE)")
 
 colA, colB = st.columns([2, 1], gap="large")
+
+# A live console that we can refresh mid-run
+console_placeholder = colA.empty()
+with colA:
+    console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+    row1 = st.columns([1, 1, 2])
+    with row1[0]:
+        train_btn = st.button("Train PINN")
+    with row1[1]:
+        render3d_btn = st.button("Render 3D from last model")
+    plot_placeholder = st.empty()
+    info_placeholder = st.empty()
+    vol_placeholder = st.empty()
+    dl_placeholder = st.empty()
 
 with colB:
     st.subheader("Room & Sound")
@@ -83,6 +97,11 @@ with colB:
 
     st.subheader("Training")
     quick = st.toggle("Quick mode (fast VM-friendly)", value=True)
+
+    # Super-fast smoke test: verifies end-to-end in <~1 min on CPU
+    smoke_test = st.checkbox("Super-fast smoke test", value=False,
+                             help="Use tiny network and few points to confirm logs/plots work.")
+
     if quick:
         width, depth = 64, 2
         adam_lr, adam_iters = 2e-3, 1200
@@ -100,9 +119,22 @@ with colB:
         Nplot_default = 96
         N3D_default, N3D_max = 64, 96
 
+    # Override with smoke-test tiny settings
+    if smoke_test:
+        adam_lr = 3e-3
+        adam_iters = 400
+        n_int, n_bnd = 1200, 400
+        width, depth = 32, 2
+        display_every = 100
+        resample_every = 0
+        Nplot_default = 48
+        N3D_default, N3D_max = 32, 64
+
     activation_key  = st.selectbox("Activation",  ["tanh", "sin", "relu"], index=0)
     initializer_key = st.selectbox("Initializer", ["Glorot uniform", "Glorot normal"], index=0)
     bc_weight = st.number_input("BC loss weight", 0.1, 50.0, 5.0, 0.1)
+
+    run_lbfgs = st.toggle("Polish with L-BFGS (slower, cleaner)", value=False)
 
     slice_choice = st.selectbox("Slice to plot", ["z-mid", "y-mid", "x-mid"], index=0)
     Nplot = st.slider("Slice grid (N × N)", 48, 192, Nplot_default, 16)
@@ -136,19 +168,6 @@ with colB:
     seat_x = st.slider("Seat x [m]", 0.0, Lx, Lx*0.6, 0.05)
     seat_y = st.slider("Seat y [m]", 0.0, Ly, Ly*0.5, 0.05)
     seat_z = st.slider("Seat z [m]", 0.0, Lz, min(Lz*0.5, 1.2), 0.05, help="Ear height ~1.2 m if Lz≈2.4")
-
-with colA:
-    st.subheader("Console")
-    st.text_area("Logs", st.session_state["log"], height=260, disabled=True)
-    row1 = st.columns([1, 1, 2])
-    with row1[0]:
-        train_btn = st.button("Train PINN")
-    with row1[1]:
-        render3d_btn = st.button("Render 3D from last model")
-    plot_placeholder = st.empty()
-    info_placeholder = st.empty()
-    vol_placeholder = st.empty()
-    dl_placeholder = st.empty()
 
 # ===================== helpers =====================
 def predict_plane(model: dde.Model, Lx, Ly, Lz, const_axis: str, const_val: float, N: int = 96):
@@ -247,10 +266,8 @@ def render_plotly_3d(xg, yg, zg, P, mode="Isosurface", use_abs=False, surf_count
                      iso_opacity=0.6, vol_surfaces=12, vol_opacity=0.25,
                      sym_zero=True, clip_mid_pct=90, demean=False):
     V = np.abs(P) if use_abs else P
-    if demean:
-        V = V - np.median(V)
+    if demean: V = V - np.median(V)
 
-    # Clip to middle percentile to suppress outliers
     tail = (100 - clip_mid_pct) / 2.0
     lo_p = float(np.percentile(V, tail))
     hi_p = float(np.percentile(V, 100 - tail))
@@ -261,8 +278,7 @@ def render_plotly_3d(xg, yg, zg, P, mode="Isosurface", use_abs=False, surf_count
         lo, hi = -rng, rng
     else:
         lo, hi = lo_p, hi_p
-        if lo == hi:
-            hi = lo + 1e-6
+        if lo == hi: hi = lo + 1e-6
 
     X, Y, Z = np.meshgrid(xg, yg, zg, indexing="ij")
     xr = X.ravel(order="F"); yr = Y.ravel(order="F"); zr = Z.ravel(order="F")
@@ -336,7 +352,6 @@ def compute_and_show_3d(model, Lx, Ly, Lz, N3D, viz_type, use_abs, surf_count,
     )
     info_placeholder.info(f"3D grid: {N3D}×{N3D}×{N3D} nodes  |  min={P.min():.3e}, max={P.max():.3e}")
 
-# ===================== training =====================
 # ===================== training =====================
 if train_btn:
     torch.set_num_threads(int(os.getenv("OMP_NUM_THREADS", "4")))
@@ -421,42 +436,67 @@ if train_btn:
     model = dde.Model(data, net)
 
     tag = run_tag()
-    ckpt = dde.callbacks.ModelCheckpoint(str(OUTDIR / f"ckpt-{tag}.pt"),
-                                         save_better_only=False, period=int(max(50, display_every)))
-    # >>> IMPORTANT: no EarlyStopping for Adam warmup
+    ckpt = dde.callbacks.ModelCheckpoint(
+        str(OUTDIR / f"ckpt-{tag}.pt"),
+        save_better_only=False,
+        period=int(max(50, display_every))
+    )
     callbacks_adam = [ckpt]
     if resample_every:
         callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
 
-    # -------- Stage 1: Adam warm-up (more iters, frequent display) --------
-    adam_iters_warmup = max(3000 if quick else 8000, int(adam_iters))  # ensure enough steps
-    display_every_adam = 100  # show actual progress
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        model.compile("adam", lr=adam_lr, loss_weights=[1.0, bc_weight])
-        losshist_adam, _ = model.train(
-            iterations=int(adam_iters_warmup),
-            callbacks=callbacks_adam,
-            display_every=int(display_every_adam),
-        )
-    st.session_state["log"] += buf.getvalue()
+    # -------- Stage 1: Adam warm-up --------
+    # ensure enough steps even if quick: use max of user/quick/smoke-test and a floor
+    adam_iters_warmup = max(800 if quick else 3000, int(adam_iters))
 
-    # -------- Stage 2: L-BFGS polish (no fixed iterations; runs to convergence) --------
-    buf2 = io.StringIO()
-    with contextlib.redirect_stdout(buf2):
+    buf = io.StringIO()
+    try:
+        with st.status("Training (Adam)…", expanded=False) as st_status:
+            t0 = time.perf_counter()
+            with contextlib.redirect_stdout(buf):
+                model.compile("adam", lr=adam_lr, loss_weights=[1.0, bc_weight])
+                losshist_adam, _ = model.train(
+                    iterations=int(adam_iters_warmup),
+                    callbacks=callbacks_adam,
+                    display_every=100,
+                )
+            dt = time.perf_counter() - t0
+            st_status.update(label=f"Adam complete in {dt:.1f}s", state="complete")
+    except Exception as e:
+        st.exception(e)
+    finally:
+        st.session_state["log"] += buf.getvalue()
+        # refresh console immediately
+        console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+
+    # -------- Stage 2: L-BFGS polish (optional) --------
+    if run_lbfgs:
+        buf2 = io.StringIO()
         try:
-            # Pytorch LBFGS is deterministic; DeepXDE wraps it
-            model.compile("L-BFGS")
-            losshist_bfgs, _ = model.train()  # no iterations arg = run until converged/plateau
+            with st.status("Polishing (L-BFGS)…", expanded=False) as st_status:
+                t0 = time.perf_counter()
+                with contextlib.redirect_stdout(buf2):
+                    model.compile("L-BFGS")
+                    losshist_bfgs, _ = model.train()  # run to convergence
+                dt = time.perf_counter() - t0
+                st_status.update(label=f"L-BFGS complete in {dt:.1f}s", state="complete")
         except Exception as e:
-            print(f"[WARN] L-BFGS failed: {e}. Continuing with Adam-only result.")
-    st.session_state["log"] += buf2.getvalue()
+            st.warning("L-BFGS failed; keeping Adam result.")
+            st.exception(e)
+        finally:
+            st.session_state["log"] += buf2.getvalue()
+            console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
 
     # residual metrics
-    pde_rms, bc_rms = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000)
-    st.session_state["log"] += f"\nPDE residual RMS: {pde_rms:.3e}   BC residual RMS: {bc_rms:.3e}\n"
+    try:
+        pde_rms, bc_rms = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000)
+        st.session_state["log"] += f"\nPDE residual RMS: {pde_rms:.3e}   BC residual RMS: {bc_rms:.3e}\n"
+        console_placeholder.text_area("Logs", st.session_state["log"], height=260, disabled=True)
+    except Exception as e:
+        st.warning("Residual metrics failed.")
+        st.exception(e)
 
-    # 2D slice + probes (unchanged below)
+    # 2D slice + probes
     which = slice_choice.split("-")[0]
     const_val = {"z": Lz/2.0, "y": Ly/2.0, "x": Lx/2.0}[which]
     A, B, P2, labels = predict_plane(model, Lx, Ly, Lz, which, const_val, N=Nplot)
@@ -484,6 +524,7 @@ if train_btn:
     info_placeholder.info(f"Seat probe @ ({seat_x:.2f},{seat_y:.2f},{seat_z:.2f}) m → p ≈ {p_seat:.3e}")
 
     # Save slice + download
+    tag = run_tag()
     out_npz = OUTDIR / f"slice_{which}mid-{tag}.npz"
     np.savez(out_npz, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k,
              src=(src_x, src_y, src_z), seat=(seat_x, seat_y, seat_z),
@@ -506,7 +547,6 @@ if train_btn:
             vol_surfaces, vol_opacity, sym_zero, clip_mid_pct, demean_for_viz,
             c, f, info_placeholder, vol_placeholder, dl_placeholder
         )
-
 
 # -------- Render 3D from last model (no retrain) --------
 if render3d_btn:
