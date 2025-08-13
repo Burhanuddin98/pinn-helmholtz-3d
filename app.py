@@ -337,6 +337,7 @@ def compute_and_show_3d(model, Lx, Ly, Lz, N3D, viz_type, use_abs, surf_count,
     info_placeholder.info(f"3D grid: {N3D}×{N3D}×{N3D} nodes  |  min={P.min():.3e}, max={P.max():.3e}")
 
 # ===================== training =====================
+# ===================== training =====================
 if train_btn:
     torch.set_num_threads(int(os.getenv("OMP_NUM_THREADS", "4")))
     geom = dde.geometry.Cuboid([0.0, 0.0, 0.0], [Lx, Ly, Lz])
@@ -419,78 +420,83 @@ if train_btn:
         net = dde.nn.FNN(layer_sizes, activation=activation_key, kernel_initializer=initializer_key)
     model = dde.Model(data, net)
 
-    # callbacks
     tag = run_tag()
     ckpt = dde.callbacks.ModelCheckpoint(str(OUTDIR / f"ckpt-{tag}.pt"),
-                                         save_better_only=False, period=int(display_every))
-    es = dde.callbacks.EarlyStopping(min_delta=1e-5, patience=5)
-    callbacks = [ckpt, es]
+                                         save_better_only=False, period=int(max(50, display_every)))
+    # >>> IMPORTANT: no EarlyStopping for Adam warmup
+    callbacks_adam = [ckpt]
     if resample_every:
-        callbacks.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
+        callbacks_adam.append(dde.callbacks.PDEPointResampler(period=int(resample_every)))
 
-    # train (capture stdout to console)
+    # -------- Stage 1: Adam warm-up (more iters, frequent display) --------
+    adam_iters_warmup = max(3000 if quick else 8000, int(adam_iters))  # ensure enough steps
+    display_every_adam = 100  # show actual progress
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         model.compile("adam", lr=adam_lr, loss_weights=[1.0, bc_weight])
-        losshist, trainstate = model.train(
-            iterations=int(adam_iters),
-            callbacks=callbacks,
-            display_every=int(display_every),
+        losshist_adam, _ = model.train(
+            iterations=int(adam_iters_warmup),
+            callbacks=callbacks_adam,
+            display_every=int(display_every_adam),
         )
     st.session_state["log"] += buf.getvalue()
+
+    # -------- Stage 2: L-BFGS polish (no fixed iterations; runs to convergence) --------
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        try:
+            # Pytorch LBFGS is deterministic; DeepXDE wraps it
+            model.compile("L-BFGS")
+            losshist_bfgs, _ = model.train()  # no iterations arg = run until converged/plateau
+        except Exception as e:
+            print(f"[WARN] L-BFGS failed: {e}. Continuing with Adam-only result.")
+    st.session_state["log"] += buf2.getvalue()
 
     # residual metrics
     pde_rms, bc_rms = residual_rms(model, Lx, Ly, Lz, k, forcing_term, N=6000)
     st.session_state["log"] += f"\nPDE residual RMS: {pde_rms:.3e}   BC residual RMS: {bc_rms:.3e}\n"
 
-    # 2D slice
+    # 2D slice + probes (unchanged below)
     which = slice_choice.split("-")[0]
     const_val = {"z": Lz/2.0, "y": Ly/2.0, "x": Lx/2.0}[which]
     A, B, P2, labels = predict_plane(model, Lx, Ly, Lz, which, const_val, N=Nplot)
     fig, ax = plt.subplots(figsize=(8, 4))
     pc = ax.pcolormesh(A, B, P2, shading="auto")
-    cbar = fig.colorbar(pc, ax=ax, label="Re{p}")
+    fig.colorbar(pc, ax=ax, label="Re{p}")
     ax.set_xlabel(labels[0]); ax.set_ylabel(labels[1]); ax.set_title(f"{which}-mid slice")
 
-    # Seat probe overlay if it lies on the shown mid-plane
-    overlayed = False
+    # Overlay source + seat if on the shown plane
     if which == "z" and abs(seat_z - const_val) < 1e-6:
-        ax.plot(src_x, src_y, "wx", markersize=6, markeredgecolor="k")  # source mark
-        ax.plot(seat_x, seat_y, "wo", markersize=6, markeredgecolor="k")  # seat mark
-        overlayed = True
+        ax.plot(src_x, src_y, "wx", markersize=6, markeredgecolor="k")
+        ax.plot(seat_x, seat_y, "wo", markersize=6, markeredgecolor="k")
     elif which == "y" and abs(seat_y - const_val) < 1e-6:
         ax.plot(src_x, src_z, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_x, seat_z, "wo", markersize=6, markeredgecolor="k")
-        overlayed = True
     elif which == "x" and abs(seat_x - const_val) < 1e-6:
         ax.plot(src_y, src_z, "wx", markersize=6, markeredgecolor="k")
         ax.plot(seat_y, seat_z, "wo", markersize=6, markeredgecolor="k")
-        overlayed = True
 
     plot_placeholder.pyplot(fig); plt.close(fig)
 
-    # Probe the trained model at the seat location
+    # Seat probe readout
     with torch.no_grad():
         p_seat = float(model.predict(np.array([[seat_x, seat_y, seat_z]], dtype=np.float32))[0, 0])
-    seat_msg = f"Seat probe @ ({seat_x:.2f},{seat_y:.2f},{seat_z:.2f}) m → p ≈ {p_seat:.3e}"
-    if overlayed:
-        info_placeholder.info(seat_msg)
-    else:
-        info_placeholder.info(seat_msg + " (seat not on shown mid-plane)")
+    info_placeholder.info(f"Seat probe @ ({seat_x:.2f},{seat_y:.2f},{seat_z:.2f}) m → p ≈ {p_seat:.3e}")
 
-    # save slice & downloadable
+    # Save slice + download
     out_npz = OUTDIR / f"slice_{which}mid-{tag}.npz"
     np.savez(out_npz, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k,
              src=(src_x, src_y, src_z), seat=(seat_x, seat_y, seat_z),
              wall_type=wall_type, alpha=alpha)
-    dl_buf = io.BytesIO()
-    np.savez(dl_buf, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k,
+    buf_npz = io.BytesIO()
+    np.savez(buf_npz, A=A, B=B, P=P2, Lx=Lx, Ly=Ly, Lz=Lz, f=f, k=k,
              src=(src_x, src_y, src_z), seat=(seat_x, seat_y, seat_z),
              wall_type=wall_type, alpha=alpha)
     dl_placeholder.download_button(
-        "Download slice (.npz)", data=dl_buf.getvalue(),
+        "Download slice (.npz)", data=buf_npz.getvalue(),
         file_name=out_npz.name, mime="application/octet-stream",
     )
+
     st.session_state["model"] = model
     st.session_state["last_tag"] = tag
 
@@ -500,6 +506,7 @@ if train_btn:
             vol_surfaces, vol_opacity, sym_zero, clip_mid_pct, demean_for_viz,
             c, f, info_placeholder, vol_placeholder, dl_placeholder
         )
+
 
 # -------- Render 3D from last model (no retrain) --------
 if render3d_btn:
